@@ -1,0 +1,1035 @@
+
+------------------------------------------------------------------------------
+Match the name of each Health Board and extract the year and month separately.
+------------------------------------------------------------------------------
+
+```{r, message=FALSE, echo=print.all.code}
+setwd("~/Desktop/project1/data")
+library(tidyverse)
+library(dplyr)
+library(MASS)
+# specify the class of the column of date
+ongoing <- read_csv("sot_performance_ongoing_waits_dec21.csv",
+                    col_types = cols(MonthEnding = col_character()))
+# delete row of New Outpatient
+ongoing <- ongoing %>% filter(PatientType!="New Outpatient")
+# extract the year and month
+ongoing <- ongoing %>% mutate(MonthEnding=as.Date(MonthEnding, format="%Y%m%d")) %>%
+separate(MonthEnding, into = c("Year", "Month", "Day"), sep = "-") %>% mutate(Year=as.integer(Year)) %>% rename(HB=HBT)
+# filter high quality data
+ongoing <- ongoing %>% filter(is.na(NumberWaitingQF))
+# match HB name
+HB_code_name <- read_csv("hb14_hb19.csv")
+a <- intersect(HB_code_name %>% dplyr::select(HB), ongoing %>% dplyr::select(HB))
+HB_code_name <- left_join(
+  a,
+  HB_code_name %>% dplyr::select(HB,HBName)
+)
+ongoing <- inner_join(
+  ongoing,
+  HB_code_name,
+  by = "HB"
+)
+# delete useless columns and columns
+ongoing <- ongoing %>% dplyr::select(-contains("QF"),-Day,-NumberWaitingOver12Weeks,-PatientType) %>% filter(Specialty!="Z9")
+```
+
+-------------------------------------------------------------------------------
+Connect the code of Specialty to the category of Specialty through the name of Specialty and aggregate "NumberWaiting" according to category of Specialty.
+-------------------------------------------------------------------------------
+
+```{r, message=FALSE, echo=print.all.code}
+# match code to name
+refer <- read_csv("specialty-reference.csv") 
+ongoing <- left_join(
+  ongoing,
+  refer,
+  by="Specialty"
+)
+ongoing <- ongoing %>% mutate(SpecialtyName=str_to_lower(SpecialtyName))
+ongoing$SpecialtyName <- gsub("&", "and", ongoing$SpecialtyName)
+# match name to category
+aggregate <- read_csv("speciality_aggregates.csv") %>% rename(SpecialtyName=Speciality, AggregatedSpecialty=`Aggregated speciality`) %>% mutate(SpecialtyName=str_to_lower(SpecialtyName))
+aggregate$SpecialtyName <- gsub("&", "and", aggregate$SpecialtyName)
+ongoing <- left_join(
+  ongoing,
+  aggregate,
+  by="SpecialtyName"
+)
+# manually specify the category of some code
+match_data <- ongoing %>% dplyr::select(Specialty,SpecialtyName,AggregatedSpecialty)  %>% filter(is.na(AggregatedSpecialty)) %>% unique()
+match_data <- match_data[order(match_data$Specialty),]
+match_data$AggregatedSpecialty <- c("Medical specialties", "Medical specialties", "Surgical specialties", "All dental specialties", "General practice", "Obstetrics & gynaecology", "Anaesthetics", "Surgical specialties", "Surgical specialties", "Surgical specialties", "Surgical specialties")
+# match code with manually specified category
+ongoing <- left_join(
+  ongoing,
+  match_data,
+  by=c("Specialty","SpecialtyName")
+)
+ongoing <- unite(ongoing,col=AggregatedSpecialty,AggregatedSpecialty.x,AggregatedSpecialty.y)
+ongoing$AggregatedSpecialty <- gsub("_NA", "", ongoing$AggregatedSpecialty)
+ongoing$AggregatedSpecialty <- gsub("NA_", "", ongoing$AggregatedSpecialty)
+# sum up NumberWaiting accoding to category
+ongoing <- ongoing %>% dplyr::select(-SpecialtyName,-Specialty) %>% group_by(Year,Month,HB,HBName, AggregatedSpecialty) %>% summarise(NumberWaiting = sum(NumberWaiting)) %>% ungroup()
+```
+
+----------------------------------------------------------------------------------
+Use "SIMD2020V2CountryQuintile" which indicates Scotland level population-weighted quintile as a criteria to evaluate the level of deprivation. Select the quintile which counts most as a represent for all of the data zones from each Health Board. 
+----------------------------------------------------------------------------------
+
+```{r, message=FALSE, echo=print.all.code}
+# select CountryQuintile
+simd <- read_csv("simd2020v2_22062020.csv") %>% dplyr::select(DataZone, HB, SIMD2020V2CountryQuintile) %>% rename(Quintile=SIMD2020V2CountryQuintile)
+#create to be useful for dataset urban_rural
+DataZone_HB <- simd %>% dplyr::select(DataZone, HB)
+# count Quintiles for each HB and select the majority level
+simd <- simd %>% group_by(HB) %>% count(Quintile) %>% filter(n==max(n)) %>% dplyr::select(HB,Quintile) %>% ungroup() %>% mutate(Quintile=relevel(factor(Quintile), '1', '2', '3', '4', '5')) 
+ongoing <- left_join(
+  ongoing,
+  simd,
+  by = 'HB'
+)
+```
+
+--------------------------------------------------------------------------------
+The process of Data Zone (2011) Urban Rural Classification 2016. Choose 2-fold classification to identify urban(0) and rural(1) areas. 
+--------------------------------------------------------------------------------
+
+```{r, message=FALSE, echo=print.all.code}
+# match urban_rural to DataZone
+urban_rural <- read_csv("urban_rural.csv") %>% mutate(UrbanRural=as.factor(UrbanRural2fold2016-1)) %>% dplyr::select(DataZone, UrbanRural)
+urban_rural <- left_join(
+  DataZone_HB,
+  urban_rural,
+  by = 'DataZone'
+)
+# count urban_rural number for each HB and select the majority level
+urban_rural <- urban_rural %>% group_by(HB) %>% count(UrbanRural) %>% filter(n==max(n)) %>% dplyr::select(HB,UrbanRural) %>% ungroup()
+ongoing <- left_join(
+  ongoing,
+  urban_rural,
+  by = 'HB'
+)
+```
+
+----------------------------------------------------------------------------------
+Dataset "Health Board (2019) Population Estimates" are transformed into 3 subsets: the population of female, the population of male and population of all ages. The first 2 subsets are converted into the population of female to male and the last one is extended to 4 variables, including the total population, the proportion of children and young adolescents (under 15 years old), the working-age population (15-64 years) and the elderly population (65 years and older).
+----------------------------------------------------------------------------------
+
+```{r, message=FALSE, echo=print.all.code}
+# transform into the first 2 subsets
+population <- read_csv("HBdemography.csv") %>% filter(Year>2011)
+female <- population %>% filter(Sex=="Female") %>% dplyr::select(Year,HB,AllAges) %>% rename(Female=AllAges)
+ongoing <- left_join(
+  ongoing,
+  female,
+  by = c('Year','HB')
+)
+male <- population %>% filter(Sex=="Male") %>% dplyr::select(Year,HB,AllAges) %>% rename(Male=AllAges)
+ongoing <- left_join(
+  ongoing,
+  male,
+  by = c('Year','HB')
+)
+# convert into the female to male ratio
+ongoing <- ongoing %>% mutate(Sex=round(Female/Male,2)) %>% dplyr::select(-Male,-Female)
+# extended to 4 variables
+allages <- population %>% filter(Sex=="All") %>% mutate(Children_and_Young=rowSums(across(Age0:Age14), na.rm = T), WorkingAge=rowSums(across(Age15:Age64), na.rm = T), Elderly=rowSums(across(Age65:Age90plus), na.rm = T)) %>% dplyr::select(Year, HB, AllAges, Children_and_Young, WorkingAge, Elderly)
+ongoing <- left_join(
+  ongoing,
+  allages,
+  by = c('Year','HB')
+)
+ongoing <- ongoing %>% mutate(Children_and_Young=round(Children_and_Young/AllAges,2),WorkingAge=round(WorkingAge/AllAges,2), Elderly=round(Elderly/AllAges,2)) %>% rename(Population=AllAges)
+```
+
+-----------------------------------------------------------------------------------
+After matching and summarizing the category of Specialty, transpose the dataset and assign the code of HB to the name of HB. 
+------------------------------------------------------------------------------------
+
+```{r, message=FALSE, echo=print.all.code}
+# match Specialty name to category
+consultantsWTE <- read_csv("consultantsWTE.csv") %>% mutate(Specialty=str_to_lower(Specialty)) %>% rename(SpecialtyName=Specialty)
+consultantsWTE$SpecialtyName <- gsub("&", "and", consultantsWTE$SpecialtyName)
+consultantsWTE <- left_join(
+  consultantsWTE,
+  aggregate,
+  by = 'SpecialtyName'
+)
+# aggregate wte by Specialty category
+consultantsWTE <- consultantsWTE %>% dplyr::select(-SpecialtyName) %>% group_by(AggregatedSpecialty) %>% summarise(across(everything(),sum))
+# transpose rows and columns 
+consultantsWTE <- consultantsWTE %>% filter(!is.na(AggregatedSpecialty)) %>% gather(key = HBName, value = value, 2:ncol(consultantsWTE)) %>% spread(key = names(consultantsWTE)[1],value = 'value')
+consultantsWTE <- consultantsWTE %>% pivot_longer(!HBName,names_to="AggregatedSpecialty", values_to= "WTE")
+consultantsWTE$HBName <- gsub("&", "and", consultantsWTE$HBName)
+consultantsWTE$HBName[consultantsWTE$HBName == "NHS Highland2"] <- "NHS Highland"
+# match HB code to name
+consultantsWTE <- left_join(
+  consultantsWTE,
+  HB_code_name,
+  by='HBName'
+)
+consultantsWTE <- consultantsWTE %>% dplyr::select(HB, AggregatedSpecialty, WTE)
+ongoing <- left_join(
+  ongoing,
+  consultantsWTE,
+  by = c('HB','AggregatedSpecialty')
+)
+```
+
+------------------------------------------------------------------------------------
+For prediction data, we begin with "Scotland Projections" to create 5 variables. We also combine other variables we have processed for "Ongoing Waits" to prediction data and create 12 months for every year. 
+------------------------------------------------------------------------------------
+
+```{r, message=FALSE, echo=print.all.code}
+# transform into the first 2 subsets
+projection <- read_csv("hb_pop_proj_03072020.csv")
+projection <- left_join(
+  a,
+  projection,
+  by="HB"
+)
+female_projection <- projection %>% filter(Sex=="Female", ) %>% dplyr::select(Year,HB,AllAges) %>% rename(Female=AllAges)
+male_projection <- projection %>% filter(Sex=="Male") %>% dplyr::select(Year,HB,AllAges) %>% rename(Male=AllAges)
+new_data <- left_join(
+  female_projection,
+  male_projection,
+  by = c('Year','HB')
+)
+# convert into the female to male ratio
+new_data <- new_data %>% mutate(Sex=round(Female/Male,2)) %>% dplyr::select(-Male,-Female)
+# extend to 4 variables
+allages_projection <- projection %>% filter(Sex=="All") %>% mutate(Children_and_Young=rowSums(across(Age0:Age14), na.rm = T), WorkingAge=rowSums(across(Age15:Age64), na.rm = T), Elderly=rowSums(across(Age65:Age90plus), na.rm = T)) %>% dplyr::select(Year, HB, AllAges, Children_and_Young, WorkingAge, Elderly)
+new_data <- left_join(
+  new_data,
+  allages_projection,
+  by = c('Year','HB')
+)
+new_data <- new_data %>% mutate(Children_and_Young=round(Children_and_Young/AllAges,2),WorkingAge=round(WorkingAge/AllAges,2), Elderly=round(Elderly/AllAges,2)) %>% rename(Population=AllAges)
+# create 12 months for every year
+month <- new_data %>% distinct(Year) %>% mutate(Month = list(1:12)) %>% unnest(Month)
+new_data <- left_join(
+  new_data,
+  month,
+  by= 'Year'
+)
+# match urban_rural to HB
+new_data <- left_join(
+  new_data,
+  urban_rural,
+  by = 'HB'
+)
+# match simd to HB
+new_data <- left_join(
+  new_data,
+  simd,
+  by = 'HB'
+)
+# match category of pecialty and WTE to HB
+Specialty_WTE <- ongoing %>% dplyr::select(HB,AggregatedSpecialty,WTE) %>% unique()
+new_data <- left_join(
+  new_data,
+  Specialty_WTE,
+  by = c('HB')
+)
+# scale numeric data
+new_data[,c("Sex","Children_and_Young","WorkingAge","Elderly","WTE")] <- scale(new_data[,c("Sex","Children_and_Young","WorkingAge","Elderly","WTE")])
+```
+
+
+-------------------------
+Exploratory Data Analysis
+-------------------------
+
+```{r NumberWaiting, message=FALSE, echo=print.all.code, fig.cap="Histogram of NumberWaiting"}
+library(ggpubr)
+# histogram of NumberWaiting
+p1 <- ggplot(data = ongoing, mapping = aes(x = NumberWaiting)) +
+   geom_histogram(aes(y = ..density..),bins = 30,alpha=0.5, col='black') +
+   geom_density(color='blue', size=1) + theme(legend.position = 'none') + ylim(0,0.0008)
+
+# histogram of log NumberWaiting
+p2 <- ggplot(data = ongoing, mapping = aes(x = log(NumberWaiting))) +
+   geom_histogram(aes(y = ..density..),bins = 30,alpha=0.5, col='black') +
+   geom_density(color='blue', size=1) + theme(legend.position = 'none')
+
+# plot 2 figures together
+ggarrange(p1, p2, ncol=1, nrow=2) 
+```
+
+
+```{r hbas, message=FALSE, echo=print.all.code, fig.cap="Health Board and Aggregated Specialty", fig.height = 5.5, fig.align = "center"}
+library(RColorBrewer)
+# define the number of colors for 14 HB
+mycolors1 <- colorRampPalette(brewer.pal(8, "BuPu"))(14)
+# create a boxplot with 14 colors use scale_fill_manual
+p1<-ggplot(ongoing, aes(x=log(NumberWaiting), y=as.factor(HBName), fill=as.factor(HBName))) + 
+  geom_boxplot() + theme_minimal() + scale_fill_manual(values = mycolors1) +
+  theme(legend.position="none") + labs(y="Health Board")
+# define the number of colors for 8 Aggregated Specialty
+mycolors2 <- colorRampPalette(brewer.pal(8, "Dark2"))(8)
+# create a boxplot with 8 colors
+p2 <- ggplot(ongoing, aes(x=log(NumberWaiting), y=as.factor(AggregatedSpecialty), fill=as.factor(AggregatedSpecialty))) + 
+  geom_boxplot() + theme_minimal() + scale_fill_manual(values = mycolors2) +
+  theme(legend.position="none") + labs(y="Aggregated Specialty")
+# plot 2 figures together
+ggarrange(p1, p2, ncol=1, nrow=2) 
+```
+
+-------------------------------------------------------------------------------
+Then we fit an analysis of variance model for the Health Boards and Aggregated Specialties.
+-------------------------------------------------------------------------------
+
+```{r aov, message=FALSE, echo=print.all.code}
+# employ aov for HB and AggregatedSpecialty
+lmod <- aov(log(NumberWaiting) ~ HB + AggregatedSpecialty, ongoing)
+# select result and transform to data frame
+b <- summary(lmod)[[1]]
+b[,c(2:4)] <- round(b[,c(2:4)])
+b[c(1:2),5] <- "<2e-16"
+b[is.na(b)] <- "-" 
+# transform data frame to table
+kbl(b, booktabs = T,caption="Results of the analysis of variance") %>%
+kable_styling(latex_options = "HOLD_position")  
+```
+
+
+```{r Time, message=FALSE, echo=print.all.code, fig.cap="Trend of time", fig.height = 4, fig.align = "center"}
+# create time series
+ongoing$Year_Month <- with(ongoing, sprintf("%d-%02d", Year, as.integer(Month)))
+# scatter plot with the factor of year
+ggplot(data=ongoing) + aes(Year_Month,log(NumberWaiting)) + geom_point(aes(colour = factor(Year))) + labs(colour = "Year", x= "Time") + theme(axis.text.x=element_blank(), 
+                                           axis.ticks.x=element_blank())
+```
+
+```{r ym, message=FALSE, echo=print.all.code, fig.cap="Trend of year and month", fig.height = 4, fig.align = "center"}
+# define the number of colors for 10 years
+mycolors1 <- colorRampPalette(brewer.pal(8, "Set2"))(10)
+# create a boxplot with 10 colors
+p1 <- ggplot(ongoing, aes(x=log(NumberWaiting), y=as.factor(Year),fill=as.factor(Year))) + 
+  geom_boxplot() + scale_fill_manual(values = mycolors1) + theme_minimal() + 
+  theme(legend.position = "none")  + labs(y="Year")
+
+# define the number of colors for months
+mycolors2 <- colorRampPalette(brewer.pal(8, "Set3"))(12)
+# create  a boxplot with 12 colors 
+p2 <- ggplot(ongoing, aes(x=log(NumberWaiting), y=Month,fill=Month)) + geom_boxplot() + 
+  scale_fill_manual(values = mycolors2) + theme_minimal() + theme(legend.position = "none") 
+
+# plot 2 figures together
+ggarrange(p1, p2, ncol=1, nrow=2) 
+```
+
+```{r popnum, message=FALSE, echo=print.all.code, fig.cap="Population vs NumberWaiting", fig.height = 3.5, fig.align = "center"}
+# define the number of colors for 14 HB
+mycolors <- colorRampPalette(brewer.pal(8, "BuGn"))(14)
+# create a scatter plot of Population and numberwaiting by HB
+ggplot(data = subset(ongoing, !is.na(Population)), 
+       mapping = aes(x=Population, y=NumberWaiting, color=HB)) + geom_point() +
+  scale_color_manual(values = mycolors) 
+```
+
+```{r corr, message=FALSE, echo=print.all.code, fig.cap="Correlation matrix for numerical covariates", fig.height = 4, fig.align = "center"}
+# install and load reshape2 package
+library(reshape2)
+# create correlation matrix
+data <- dplyr::select(select_if(ongoing, is.numeric),-NumberWaiting)
+cormat <- round(cor(data, use = "pairwise.complete.obs"),2)
+# use correlation between variables as distance
+reorder_cormat <- function(cormat){
+ dd <- as.dist((1-cormat)/2)
+ hc <- hclust(dd)
+ cormat <-cormat[hc$order, hc$order]
+}
+cormat <- reorder_cormat(cormat)
+# get upper triangle of the correlation matrix
+get_upper_tri <- function(cormat){
+  cormat[lower.tri(cormat)]<- NA
+  return(cormat)
+}
+upper_tri <- get_upper_tri(cormat)
+# melt the correlation matrix
+melted_cormat <- melt(upper_tri, na.rm = TRUE)
+# plot heatmap
+ggheatmap <- ggplot(melted_cormat , aes(Var2, Var1, fill = value)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0, 
+                       limit = c(-1,1), space = "Lab", name="Pearson\nCorrelation") +
+  theme_minimal() + 
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, size = 12, hjust = 1)) + coord_fixed()
+ggheatmap + geom_text(aes(Var2, Var1, label = value), color = "black", size = 4) +
+  theme(axis.title.x = element_blank(), axis.title.y = element_blank(),
+        panel.grid.major = element_blank(), panel.border = element_blank(),
+        panel.background = element_blank(), axis.ticks = element_blank(),
+        legend.justification = c(1, 0), legend.position = c(0.6, 0.7),
+        legend.direction = "horizontal") + 
+  guides(fill = guide_colorbar(barwidth = 7, barheight = 1, title.position = "top", 
+                               title.hjust = 0.5))
+```
+
+-------------------------------------
+Selection of the stepwise regression
+-------------------------------------
+
+```{r stepwise, message=FALSE, echo=print.all.code}
+# scale numrical variables
+ongoing[,c("Sex","Children_and_Young","WorkingAge","Elderly","WTE")] <- scale(ongoing[,c("Sex","Children_and_Young","WorkingAge","Elderly","WTE")])
+# employ stepwise regression
+lm <- lm(log(NumberWaiting) ~ Year + Month + Sex + Children_and_Young + WorkingAge + Elderly + Quintile + UrbanRural + WTE +  AggregatedSpecialty + offset(log(Population)), ongoing)
+step.model <- step(lm, direction = "both", trace = FALSE)
+# make data frame of the result
+c <- data.frame(round(summary(step.model)[[4]],3))
+colnames(c)[2:4] <- c("Std. Error","t value","Pr(>|t|)")
+rownames(c)[12:18] <- gsub("AggregatedSpecialty", "", rownames(c)[12:18])
+# transform data frame to table
+kbl(c, booktabs = T,caption="Results of stepwise regression") %>%
+kable_styling(latex_options = "HOLD_position")  
+```
+
+----------------------------------------------------
+Generalized Linear Mixed Models with Poisson Family
+----------------------------------------------------
+
+```{r glmpoi, warning = FALSE, message=FALSE, echo=print.all.code, fig.cap="Diagnostic plots for Poisson generalized linear mixed model", fig.height = 3.8, fig.align = "center"}
+library(lme4)
+# employ glmm with poisson family
+glmm <- glmer(NumberWaiting ~ Year + Sex + Children_and_Young + 
+    WorkingAge + Quintile + UrbanRural + WTE + AggregatedSpecialty + 
+    offset(log(Population)) + (1|HB) ,family = poisson(),data= ongoing)
+# output diagnostic plots
+par(mfrow=c(1,2),mar=c(4,3.8,1,1),oma=c(1,1,1,1))
+qqnorm(residuals(glmm),main="",ylim=c(-20,20))
+qqline(residuals(glmm),col=2,lwd=2)
+plot(fitted(glmm),residuals(glmm),xlab="Fitted",ylab="Residuals")
+abline(h=0)
+```
+
+-------------------------------------------
+Zero-Inflated Gaussian Linear Mixed Models
+-------------------------------------------
+
+```{r zipoi, warning = FALSE, message=FALSE, echo=print.all.code, fig.cap="Diagnostic plots for zero-inflated Poission linear mixed model", fig.height = 3.8, fig.align = "center"}
+library("glmmTMB")
+library("bbmle") 
+# employ zero-inflated poisson mixed models
+fit_zipoisson <- glmmTMB(NumberWaiting ~ Year + Sex + WorkingAge + Elderly + 
+    Quintile + UrbanRural + WTE + AggregatedSpecialty + offset(log(Population)) + (1|HB), data=ongoing, ziformula=~1, family=poisson())
+# warning in summary
+# summary(fit_zipoisson)
+# output diagnostic plots
+par(mfrow=c(1,2),mar=c(4,3.8,1,1),oma=c(1,1,1,1))
+qqnorm(residuals(fit_zipoisson),main="")
+qqline(residuals(fit_zipoisson),col=2,lwd=2)
+plot(fitted(fit_zipoisson),residuals(fit_zipoisson),xlab="Fitted",ylab="Residuals")
+abline(h=0)
+```
+
+```{r zigau, warning = FALSE, message=FALSE, echo=print.all.code, fig.cap="Diagnostic plots for zero-inflated Gaussian linear mixed model", fig.height = 6, fig.align = "center"}
+# employ zero-inflated gaussian mixed models
+fit_zigaussian <- glmmTMB(log(NumberWaiting) ~ Year + Sex + Children_and_Young + 
+    WorkingAge + Quintile + UrbanRural + WTE + AggregatedSpecialty + 
+    offset(log(Population)) + (1|HB), data=ongoing, ziformula=~1,family=gaussian)
+# output diagnostic plots
+par(mfrow=c(2,2),mar=c(4,3.8,1,1),oma=c(1,1,1,1))
+qqnorm(residuals(fit_zigaussian),main="")
+qqline(residuals(fit_zigaussian),col=2,lwd=2)
+plot(fitted(fit_zigaussian),residuals(fit_zigaussian),xlab="Fitted",ylab="Residuals")
+abline(h=0)
+qqnorm(residuals(fit_zigaussian),main="",ylim=c(-20,20))
+qqline(residuals(fit_zigaussian),col=2,lwd=2)
+plot(fitted(fit_zigaussian),residuals(fit_zigaussian),xlab="Fitted",ylab="Residuals",ylim=c(-20,20))
+abline(h=0)
+```
+
+-----------------
+Model Comparison
+-----------------
+
+```{r aicbic, warning=FALSE, message=FALSE, echo=print.all.code}
+library(performance)
+# derive AIC and BIC
+glmmaic <- data.frame(summary(glmm)$AICtab)
+zigaic <- data.frame(summary(fit_zigaussian)$AICtab)
+d <- cbind(glmmaic, zigaic)
+colnames(d) <- c("GLMMPoisson","ZIGaussian")
+# calculate dispersion
+d["Dispersion",]=c(sum(residuals(glmm,type="pearson")^2)/df.residual(glmm),
+                   summary(fit_zigaussian)$sigma^2)
+# calculate R2
+d["Conditional R2",]=c(r2(glmm)[1],r2(fit_zigaussian)[1])
+d["Marginal R2",]=c(r2(glmm)[2],r2(fit_zigaussian)[2])
+# calculate chi squared
+chi <- 2*(glmmaic["logLik",]-zigaic["logLik",])
+d["Chi",]=c("-",chi)
+d["p-value",]=c("-",1-pchisq(chi,glmmaic["df.resid",]-zigaic["df.resid",]))
+# transform data frame to table
+d <- data.frame(d)
+d[c(1:8),1] <- round(as.numeric(d[c(1:8),1]),5)
+d[,2] <- round(as.numeric(d[,2]),5)
+d["df.resid",2] <- as.character(d["df.resid",2])
+kbl(d, booktabs = T,caption="Comparison of 2 models") %>%
+kable_styling(latex_options = "HOLD_position")  
+```
+
+-----------------
+Model Prediction
+-----------------
+
+```{r sumcom, message=FALSE, echo=print.all.code}
+# extract coefficients
+e <- coef(summary(glmm))
+f <- summary(fit_zigaussian)$coefficients$cond
+# combine to a data frame
+g <- data.frame(cbind(e,f))
+# select necessary columns
+g <- g[,c(-2,-3,-6,-7)]
+colnames(g)[c(1:4)] <- c("Estimate","Pr(>|z|)","Estimate","Pr(>|z|)")
+rownames(g)[12:18] <- gsub("AggregatedSpecialty", "", rownames(g)[12:18])
+# transform data frame to table and mark some cells
+g %>%  kbl(booktabs = T,caption="Comparison the fixed effects of 2 models") %>% 
+  add_header_above(c(" ", "GLMMPoisson"=2, "ZIGaussian" = 2)) %>%
+  column_spec(c(1,2,3), color = ifelse(g[,2] > 0.05, "red", "black")) %>%
+  column_spec(c(1,4,5), color = ifelse(g[,4] > 0.05, "blue", "black")) %>%
+  kable_styling(latex_options = "HOLD_position") 
+```
+
+```{r ci, warning=FALSE, message=FALSE, echo=print.all.code, fig.cap="Confidence intervals for the random effects",fig.height = 5.3, fig.align = "center"}
+library(lattice)
+# extract 95% CI and transform into data frame
+i <- data.frame(ranef(fit_zigaussian)$cond)
+i <- rownames_to_column(i, "HB")
+# match HB name to its code
+i <- left_join(
+  i,
+  HB_code_name,
+  by="HB"
+)
+# transform HB code in the list to its name
+j <- ranef(fit_zigaussian)$cond
+j <- lapply(j, "rownames<-", i$HBName)
+# output caterpillar plot
+n <- dotplot.ranef.mer(j,mains=FALSE)
+n$HB$main <- ""
+n$HB
+```
+
+```{r preplot, warning=FALSE, message=FALSE, echo=print.all.code, fig.cap="Effectiveness of model prediction",fig.height = 6, fig.align = "center"}
+# predict numberwaiting in regression data
+ongoing$Pre <- exp(predict(fit_zigaussian,ongoing,type="response"))
+# select unique value
+h <- ongoing %>% dplyr::select(Year,HB,AggregatedSpecialty,NumberWaiting, Pre) %>% distinct()
+# comparison plot of regression data
+p1 <- ggplot(h, aes(x = Pre, y = NumberWaiting)) +
+  geom_point() + geom_abline(intercept = 0, slope = 1, color = "red", size = 1) +
+  labs(x = "Predicted Value of Regression Data", y = "Actual Value") + geom_smooth(formula=y ~ x, method = 'loess')
+# predict numberwaiting in prediction data
+new_data$NumberWaitingPre <- exp(predict(fit_zigaussian,new_data,type="response"))
+# select unique prediction value
+new_data_pre <- new_data %>% dplyr::select(Year,HB,AggregatedSpecialty,NumberWaitingPre) %>%
+  filter(Year <= 2021)  %>% distinct()
+# select unique actual value
+onging_pre <- ongoing %>% dplyr::select(Year,HB,AggregatedSpecialty,NumberWaiting) %>%
+   filter(Year <= 2021 & Year >= 2018) %>% distinct()
+# combine into a fata frame
+pre <- left_join(
+  onging_pre,
+  new_data_pre,
+  by=c('Year','HB','AggregatedSpecialty'))
+# comparison plot of prediction data
+p2 <- ggplot(pre, aes(x = NumberWaitingPre, y = NumberWaiting)) +
+  geom_point() + geom_abline(intercept = 0, slope = 1, color = "red", size = 1) +
+  labs(x = "Predicted Value of Prediction Data", y = "Actual Value") + geom_smooth(formula=y ~ x,method = 'loess')
+# plot 2 figures together
+ggarrange(p1,p2,ncol=1,nrow=2)
+```
+
+------------------------------------------------------------------------------
+convert the missing value to zeros, as well as create and export a new ongoing dataset.Calculates and compares the output of a new zero-inflated Gaussian model with zeros in "NumberWaiting". 
+--------------------------------------------------------------------------------
+
+```{r zeronafit, warning=FALSE, message=FALSE, echo=print.all.code}
+# input the dataset ongoingzero created
+ongoingzero <- read.csv("ongoingzero.csv")
+ongoingzero <- ongoingzero %>% filter(AggregatedSpecialty != "Occupational medicine")
+# employ zero-inflated gaussian mixed models
+fit_zero <- glmmTMB(log2(NumberWaiting+1) ~ Year + Sex + Children_and_Young + 
+    WorkingAge + Quintile + UrbanRural + WTE + AggregatedSpecialty + 
+    offset(log(Population)) + (1|HB), data=ongoingzero, ziformula=~1,family=gaussian)
+# input the dataset ongoingzero created
+wtemissing <- read.csv("consultantWTEmissing.csv")
+# employ zero-inflated gaussian mixed models
+fit_missing <- glmmTMB(log(NumberWaiting) ~ Year + Sex + Children_and_Young + 
+    WorkingAge + Quintile + UrbanRural + WTE + AggregatedSpecialty + 
+    offset(log(Population)) + (1|HB), data=wtemissing, ziformula=~1,family=gaussian)
+# derive AIC and BIC
+zeromaic <- data.frame(summary(fit_zero)$AICtab)
+naaic <- data.frame(summary(fit_missing)$AICtab)
+k <- cbind(zeromaic, zigaic)
+k <-cbind(k, naaic)
+colnames(k) <- c("ZeroNumberWaiting","ZIGaussian","MissingWTE")
+# calculate dispersion
+k["Dispersion",]=c(summary(fit_zero)$sigma^2,summary(fit_zigaussian)$sigma^2,
+                   summary(fit_missing)$sigma^2)
+# calculate R2
+k["Conditional R2",]=c(r2(fit_zero)[1],r2(fit_zigaussian)[1],r2(fit_missing)[1])
+k["Marginal R2",]=c(r2(fit_zero)[2],r2(fit_zigaussian)[2],r2(fit_missing)[2])
+# calculate chi squared
+chi1 <- 2*(zeromaic["logLik",]-zigaic["logLik",])
+chi2 <- 2*(zigaic["logLik",]-naaic["logLik",])
+k["Chi",]=c(chi1,"-",chi2)
+pvalue1 <- 1-pchisq(chi1,zeromaic["df.resid",]-zigaic["df.resid",])
+pvalue2 <- 1-pchisq(chi2,zigaic["df.resid",]-naaic["df.resid",])
+k["p-value",]=c(pvalue1,"-",pvalue2)
+# transform data frame to table
+k <- data.frame(k)
+k[,1] <- round(as.numeric(k[,1]),5)
+k[c(1:8),2] <- round(as.numeric(k[c(1:8),2]),5)
+k[,3] <- round(as.numeric(k[,3]),5)
+
+k["df.resid",c(1,3)] <- as.character(k["df.resid",c(1,3)])
+kbl(k, booktabs = T,caption="Comparison of models of controversy") %>%
+kable_styling(latex_options = "HOLD_position")  
+```
+
+---------------------------------------------------------------------------------
+Create and export a new ongoing dataset while converting these zeros to missing values. This new data has the same dimensions as the original, but there are many missing values in column "WTE".
+---------------------------------------------------------------------------------
+
+```{r nozero, warning=FALSE, message=FALSE, echo=print.all.code}
+fit_gaussian <- glmmTMB(log(NumberWaiting) ~ Year + Sex + Children_and_Young + 
+    WorkingAge + Quintile + UrbanRural + WTE + AggregatedSpecialty + 
+    offset(log(Population)) + (1|HB), data=ongoing, ziformula=~0,family=gaussian)
+# derive AIC and BIC
+gaic <- data.frame(summary(fit_gaussian)$AICtab)
+l <- cbind(gaic, zigaic)
+colnames(l) <- c("Gaussian","ZIGaussian")
+# calculate dispersion
+l["Dispersion",]=c(summary(fit_gaussian)$sigma^2,summary(fit_zigaussian)$sigma^2)
+# calculate R2
+l["Conditional R2",]=c(r2(fit_gaussian)[1],r2(fit_zigaussian)[1])
+l["Marginal R2",]=c(r2(fit_gaussian)[2],r2(fit_zigaussian)[2])
+# calculate chi squared
+chi <- 2*(gaic["logLik",]-zigaic["logLik",])
+l["Chi",]=c("-",chi)
+l["p-value",]=c("-",1-pchisq(chi,gaic["df.resid",]-zigaic["df.resid",]))
+# transform data frame to table
+l <- data.frame(l)
+l[c(1:8),1] <- round(as.numeric(l[c(1:8),1]),5)
+l[,2] <- round(as.numeric(l[,2]),5)
+l["df.resid",2] <- as.character(l["df.resid",2])
+kbl(l, booktabs = T,caption="Comparison of 2 models of zero-inflated effect") %>%
+kable_styling(latex_options = "HOLD_position")  
+```
+
+-------------
+Data Pattern
+------------
+
+```{r Missingness, message=FALSE, echo=print.all.code, fig.cap="Missingness"}
+library(VIM)
+aggr(ongoing[1:(length(ongoing)-2)],numbers=TRUE)
+```
+
+---------------------------
+Code of Data "ongoingzero"
+---------------------------
+
+```{r, eval = FALSE}
+setwd("~/Desktop/project1/data")
+library(tidyverse)
+library(dplyr)
+library(MASS)
+# specify the class of the column of date
+ongoing <- read_csv("sot_performance_ongoing_waits_dec21.csv",
+                    col_types = cols(MonthEnding = col_character()))
+# delete row of New Outpatient
+ongoing <- ongoing %>% filter(PatientType!="New Outpatient")
+# extract the year and month
+ongoing <- ongoing %>% mutate(MonthEnding=as.Date(MonthEnding, format="%Y%m%d")) %>%
+  separate(MonthEnding, into = c("Year", "Month" , "Day"), sep = "-") %>%
+  rename(HB=HBT)
+# filter high quality data
+ongoing <- ongoing %>% replace_na(list(NumberWaiting=0))
+# match HB name
+HB_code_name <- read_csv("hb14_hb19.csv")
+a <- intersect(HB_code_name %>% dplyr::select(HB), ongoing %>% dplyr::select(HB))
+HB_code_name <- left_join(
+  a,
+  HB_code_name %>% dplyr::select(HB,HBName)
+)
+ongoing <- inner_join(
+  ongoing,
+  HB_code_name,
+  by = "HB"
+)
+# delete useless columns and columns
+ongoing <- ongoing %>%
+  dplyr::select(-contains("QF"),-Day,-NumberWaitingOver12Weeks,-PatientType)
+ongoing <- ongoing %>% mutate(Year=as.integer(Year)) %>% filter(Specialty!="Z9")
+```
+
+```{r, eval = FALSE}
+# match code to name
+refer <- read_csv("specialty-reference.csv") 
+ongoing <- left_join(
+  ongoing,
+  refer,
+  by="Specialty"
+)
+ongoing <- ongoing %>% mutate(SpecialtyName=str_to_lower(SpecialtyName))
+ongoing$SpecialtyName <- gsub("&", "and", ongoing$SpecialtyName)
+# match name to category
+aggregate <- read_csv("speciality_aggregates.csv") %>%
+  rename(SpecialtyName=Speciality, AggregatedSpecialty=`Aggregated speciality`) %>%
+  mutate(SpecialtyName=str_to_lower(SpecialtyName))
+aggregate$SpecialtyName <- gsub("&", "and", aggregate$SpecialtyName)
+ongoing <- left_join(
+  ongoing,
+  aggregate,
+  by="SpecialtyName")
+# manually specify the category of some code
+match_data <- ongoing %>% 
+  dplyr::select(Specialty,SpecialtyName,AggregatedSpecialty)  %>%
+  filter(is.na(AggregatedSpecialty)) %>% unique()
+match_data <- match_data[order(match_data$Specialty),]
+match_data$AggregatedSpecialty <- c(rep("Medical specialties",7), 
+                                    rep("Surgical specialties",8),
+                                    "All dental specialties",
+                                    rep("General practice",2),
+                                    rep("Obstetrics & gynaecology",2), 
+                                    rep("Psychiatric specialties",3), 
+                                    rep("Occupational medicine",10))
+# match code with manually specified category
+ongoing <- left_join(
+  ongoing,
+  match_data,
+  by=c("Specialty","SpecialtyName")
+)
+ongoing <- unite(ongoing,col=AggregatedSpecialty,AggregatedSpecialty.x,
+                 AggregatedSpecialty.y)
+ongoing$AggregatedSpecialty <- gsub("_NA", "", ongoing$AggregatedSpecialty)
+ongoing$AggregatedSpecialty <- gsub("NA_", "", ongoing$AggregatedSpecialty)
+# sum up NumberWaiting accoding to category
+ongoing <- ongoing %>% dplyr::select(-SpecialtyName,-Specialty) %>%
+  group_by(Year,Month,HB,AggregatedSpecialty) %>% 
+  summarise(NumberWaiting = sum(NumberWaiting)) %>% ungroup()
+```
+
+```{r, eval = FALSE}
+# select CountryQuintile
+simd <- read_csv("simd2020v2_22062020.csv") %>% 
+  dplyr::select(DataZone, HB, SIMD2020V2CountryQuintile) %>%
+  rename(Quintile=SIMD2020V2CountryQuintile)
+#create to be useful for dataset urban_rural
+DataZone_HB <- simd %>% dplyr::select(DataZone, HB)
+# count Quintiles for each HB and select the majority level
+simd <- simd %>% group_by(HB) %>% count(Quintile) %>% filter(n==max(n)) %>%
+  dplyr::select(HB,Quintile) %>% ungroup() %>%
+  mutate(Quintile=relevel(factor(Quintile), '1', '2', '3', '4', '5')) 
+ongoing <- left_join(
+  ongoing,
+  simd,
+  by = 'HB'
+)
+```
+
+```{r, eval = FALSE}
+# match urban_rural to DataZone
+urban_rural <- read_csv("urban_rural.csv") %>%
+  mutate(UrbanRural=as.factor(UrbanRural2fold2016-1)) %>% 
+  dplyr::select(DataZone, UrbanRural)
+urban_rural <- left_join(
+  DataZone_HB,
+  urban_rural,
+  by = 'DataZone'
+)
+# count urban_rural number for each HB and select the majority level
+urban_rural <- urban_rural %>% group_by(HB) %>% count(UrbanRural) %>%
+  filter(n==max(n)) %>% dplyr::select(HB,UrbanRural) %>% ungroup()
+ongoing <- left_join(
+  ongoing,
+  urban_rural,
+  by = 'HB'
+)
+```
+
+```{r, eval = FALSE}
+# transform into the first 2 subsets
+population <- read_csv("HBdemography.csv") %>% filter(Year>2011)
+female <- population %>% filter(Sex=="Female") %>% dplyr::select(Year,HB,AllAges)
+%>% rename(Female=AllAges)
+ongoing <- left_join(
+  ongoing,
+  female,
+  by = c('Year','HB')
+)
+male <- population %>% filter(Sex=="Male") %>% dplyr::select(Year,HB,AllAges) %>%
+  rename(Male=AllAges)
+ongoing <- left_join(
+  ongoing,
+  male,
+  by = c('Year','HB')
+)
+# convert into the female to male ratio
+ongoing <- ongoing %>% mutate(Sex=round(Female/Male,2)) %>%
+  dplyr::select(-Male,-Female)
+# extended to 4 variables
+allages <- population %>% filter(Sex=="All") %>%
+  mutate(Children_and_Young=rowSums(across(Age0:Age14), na.rm = T),
+         WorkingAge=rowSums(across(Age15:Age64), na.rm = T),
+         Elderly=rowSums(across(Age65:Age90plus), na.rm = T)) %>%
+  dplyr::select(Year, HB, AllAges, Children_and_Young, WorkingAge, Elderly)
+ongoing <- left_join(
+  ongoing,
+  allages,
+  by = c('Year','HB')
+)
+ongoing <- ongoing %>%
+  mutate(Children_and_Young=round(Children_and_Young/AllAges,2),
+         WorkingAge=round(WorkingAge/AllAges,2), Elderly=round(Elderly/AllAges,2))
+%>% rename(Population=AllAges)
+```
+
+```{r, eval = FALSE}
+# match Specialty name to category
+consultantsWTE <- read_csv("consultantsWTE.csv") %>%
+  mutate(Specialty=str_to_lower(Specialty)) %>% rename(SpecialtyName=Specialty)
+consultantsWTE$SpecialtyName <- gsub("&", "and", consultantsWTE$SpecialtyName)
+consultantsWTE <- left_join(
+  consultantsWTE,
+  aggregate,
+  by = 'SpecialtyName'
+)
+# aggregate wte by Specialty category
+consultantsWTE <- consultantsWTE %>% dplyr::select(-SpecialtyName) %>%
+  group_by(AggregatedSpecialty) %>% summarise(across(everything(),sum))
+# transpose rows and columns 
+consultantsWTE <- consultantsWTE %>% filter(!is.na(AggregatedSpecialty)) %>%
+  gather(key = HBName, value = value, 2:ncol(consultantsWTE)) %>% 
+  spread(key = names(consultantsWTE)[1],value = 'value')
+consultantsWTE <- consultantsWTE %>% pivot_longer(!HBName,names_to="AggregatedSpecialty", values_to= "WTE")
+consultantsWTE$HBName <- gsub("&", "and", consultantsWTE$HBName)
+consultantsWTE$HBName[consultantsWTE$HBName == "NHS Highland2"] <- "NHS Highland"
+# match HB code to name
+consultantsWTE <- left_join(
+  consultantsWTE,
+  HB_code_name,
+  by='HBName'
+)
+consultantsWTE <- consultantsWTE %>% dplyr::select(HB, AggregatedSpecialty, WTE)
+ongoing <- left_join(
+  ongoing,
+  consultantsWTE,
+  by = c('HB','AggregatedSpecialty')
+)
+```
+
+```{r, eval = FALSE}
+ongoing[,c("Sex","Children_and_Young","WorkingAge","Elderly","WTE")] <-
+  scale(ongoing[,c("Sex","Children_and_Young","WorkingAge","Elderly","WTE")])
+write_csv(ongoing,"ongoingzero.csv")
+```
+
+
+------------------------------------
+Code of Data "consultantWTEmissing"
+-------------------------------------
+
+```{r, eval = FALSE}
+setwd("~/Desktop/project1/data")
+library(tidyverse)
+library(dplyr)
+library(MASS)
+# specify the class of the column of date
+ongoing <- read_csv("sot_performance_ongoing_waits_dec21.csv",
+                    col_types = cols(MonthEnding = col_character()))
+# delete row of New Outpatient
+ongoing <- ongoing %>% filter(PatientType!="New Outpatient")
+# extract the year and month
+ongoing <- ongoing %>% mutate(MonthEnding=as.Date(MonthEnding, format="%Y%m%d")) %>%
+  separate(MonthEnding, into = c("Year", "Month", "Day"), sep = "-") %>%
+  mutate(Year=as.integer(Year)) %>% rename(HB=HBT)
+# filter high quality data
+ongoing <- ongoing %>% filter(is.na(NumberWaitingQF))
+# match HB name
+HB_code_name <- read_csv("hb14_hb19.csv")
+a <- intersect(HB_code_name %>% dplyr::select(HB), ongoing %>% dplyr::select(HB))
+HB_code_name <- left_join(
+  a,
+  HB_code_name %>% dplyr::select(HB,HBName)
+)
+ongoing <- inner_join(
+  ongoing,
+  HB_code_name,
+  by = "HB")
+# delete useless columns and columns
+ongoing <- ongoing %>%
+  dplyr::select(-contains("QF"),-Day,-NumberWaitingOver12Weeks,-PatientType) %>%
+  filter(Specialty!="Z9")
+```
+
+```{r,eval = FALSE}
+# match code to name
+refer <- read_csv("specialty-reference.csv") 
+ongoing <- left_join(
+  ongoing,
+  refer,
+  by="Specialty"
+)
+ongoing <- ongoing %>% mutate(SpecialtyName=str_to_lower(SpecialtyName))
+ongoing$SpecialtyName <- gsub("&", "and", ongoing$SpecialtyName)
+# match name to category
+aggregate <- read_csv("speciality_aggregates.csv") %>%
+  rename(SpecialtyName=Speciality, AggregatedSpecialty=`Aggregated speciality`) %>%
+  mutate(SpecialtyName=str_to_lower(SpecialtyName))
+aggregate$SpecialtyName <- gsub("&", "and", aggregate$SpecialtyName)
+ongoing <- left_join(
+  ongoing,
+  aggregate,
+  by="SpecialtyName"
+)
+# manually specify the category of some code
+match_data <- ongoing %>% 
+  dplyr::select(Specialty,SpecialtyName,AggregatedSpecialty) %>%
+  filter(is.na(AggregatedSpecialty)) %>% unique()
+match_data <- match_data[order(match_data$Specialty),]
+match_data$AggregatedSpecialty <- c("Medical specialties", "Medical specialties",
+                                    "Surgical specialties", "All dental specialties",
+                                    "General practice", "Obstetrics & gynaecology",
+                                    "Anaesthetics", "Surgical specialties", 
+                                    "Surgical specialties", "Surgical specialties",
+                                    "Surgical specialties")
+# match code with manually specified category
+ongoing <- left_join(
+  ongoing,
+  match_data,
+  by=c("Specialty","SpecialtyName")
+)
+ongoing <- unite(ongoing,col=AggregatedSpecialty,AggregatedSpecialty.x,
+                 AggregatedSpecialty.y)
+ongoing$AggregatedSpecialty <- gsub("_NA", "", ongoing$AggregatedSpecialty)
+ongoing$AggregatedSpecialty <- gsub("NA_", "", ongoing$AggregatedSpecialty)
+# sum up NumberWaiting accoding to category
+ongoing <- ongoing %>% dplyr::select(-SpecialtyName,-Specialty) %>% 
+  group_by(Year,Month,HB,HBName, AggregatedSpecialty) %>% 
+  summarise(NumberWaiting = sum(NumberWaiting)) %>% ungroup()
+```
+
+```{r,eval = FALSE}
+# select CountryQuintile
+simd <- read_csv("simd2020v2_22062020.csv") %>% 
+  dplyr::select(DataZone, HB, SIMD2020V2CountryQuintile) %>%
+  rename(Quintile=SIMD2020V2CountryQuintile)
+#create to be useful for dataset urban_rural
+DataZone_HB <- simd %>% dplyr::select(DataZone, HB)
+# count Quintiles for each HB and select the majority level
+simd <- simd %>% group_by(HB) %>% count(Quintile) %>% filter(n==max(n)) %>%
+  dplyr::select(HB,Quintile) %>% ungroup() %>%
+  mutate(Quintile=relevel(factor(Quintile), '1', '2', '3', '4', '5')) 
+ongoing <- left_join(
+  ongoing,
+  simd,
+  by = 'HB'
+)
+```
+
+```{r, eval = FALSE}
+# match urban_rural to DataZone
+urban_rural <- read_csv("urban_rural.csv") %>%
+  mutate(UrbanRural=as.factor(UrbanRural2fold2016-1)) %>% 
+  dplyr::select(DataZone, UrbanRural)
+urban_rural <- left_join(
+  DataZone_HB,
+  urban_rural,
+  by = 'DataZone'
+)
+# count urban_rural number for each HB and select the majority level
+urban_rural <- urban_rural %>% group_by(HB) %>% count(UrbanRural) %>%
+  filter(n==max(n)) %>% dplyr::select(HB,UrbanRural) %>% ungroup()
+ongoing <- left_join(
+  ongoing,
+  urban_rural,
+  by = 'HB'
+)
+```
+
+```{r, eval = FALSE}
+# transform into the first 2 subsets
+population <- read_csv("HBdemography.csv") %>% filter(Year>2011)
+female <- population %>% filter(Sex=="Female") %>% dplyr::select(Year,HB,AllAges)
+%>% rename(Female=AllAges)
+ongoing <- left_join(
+  ongoing,
+  female,
+  by = c('Year','HB')
+)
+male <- population %>% filter(Sex=="Male") %>% dplyr::select(Year,HB,AllAges) %>%
+  rename(Male=AllAges)
+ongoing <- left_join(
+  ongoing,
+  male,
+  by = c('Year','HB')
+)
+# convert into the female to male ratio
+ongoing <- ongoing %>% mutate(Sex=round(Female/Male,2)) %>%
+  dplyr::select(-Male,-Female)
+# extended to 4 variables
+allages <- population %>% filter(Sex=="All") %>%
+  mutate(Children_and_Young=rowSums(across(Age0:Age14), na.rm = T),
+         WorkingAge=rowSums(across(Age15:Age64), na.rm = T),
+         Elderly=rowSums(across(Age65:Age90plus), na.rm = T)) %>% 
+  dplyr::select(Year, HB, AllAges, Children_and_Young, WorkingAge, Elderly)
+ongoing <- left_join(
+  ongoing,
+  allages,
+  by = c('Year','HB')
+)
+ongoing <- ongoing %>%
+  mutate(Children_and_Young=round(Children_and_Young/AllAges,2),
+                              WorkingAge=round(WorkingAge/AllAges,2),
+                              Elderly=round(Elderly/AllAges,2)) %>%
+  rename(Population=AllAges)
+```
+
+```{r,eval = FALSE}
+consultantsWTE <- read_csv("consultantsWTE.csv") %>%
+  mutate(Specialty=str_to_lower(Specialty)) %>% rename(SpecialtyName=Specialty)
+# transform zero value to missing
+consultantsWTE[consultantsWTE == 0] <- NA
+consultantsWTE$SpecialtyName <- gsub("&", "and", consultantsWTE$SpecialtyName)
+# match Specialty name to category
+consultantsWTE <- left_join(
+  consultantsWTE,
+  aggregate,
+  by = 'SpecialtyName'
+)
+# aggregate wte by Specialty category
+consultantsWTE <- consultantsWTE %>% dplyr::select(-SpecialtyName) %>%
+  group_by(AggregatedSpecialty) %>% summarise(across(everything(),sum))
+# transpose rows and columns 
+consultantsWTE <- consultantsWTE %>% filter(!is.na(AggregatedSpecialty)) %>%
+  gather(key = HBName, value = value, 2:ncol(consultantsWTE)) %>% 
+  spread(key = names(consultantsWTE)[1],value = 'value')
+consultantsWTE <- consultantsWTE %>%
+  pivot_longer(!HBName,names_to="AggregatedSpecialty", values_to= "WTE")
+consultantsWTE$HBName <- gsub("&", "and", consultantsWTE$HBName)
+consultantsWTE$HBName[consultantsWTE$HBName == "NHS Highland2"] <- "NHS Highland"
+# match HB code to name
+consultantsWTE <- left_join(
+  consultantsWTE,
+  HB_code_name,
+  by='HBName'
+)
+consultantsWTE <- consultantsWTE %>% dplyr::select(HB, AggregatedSpecialty, WTE)
+ongoing <- left_join(
+  ongoing,
+  consultantsWTE,
+  by = c('HB','AggregatedSpecialty')
+)
+```
+
+```{r,eval = FALSE}
+ongoing[,c("Sex","Children_and_Young","WorkingAge","Elderly","WTE")] <-
+  scale(ongoing[,c("Sex","Children_and_Young","WorkingAge","Elderly","WTE")])
+write_csv(ongoing,"consultantWTEmissing.csv")
+```
